@@ -1,0 +1,40 @@
+---
+title: "Louisville Dockless Vehicles"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load packages
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+```
+
+# Load data
+
+```{r}
+escooters_precovid <-
+  read_csv('raw_data/escooters-precovid.csv',
+           col_types = cols(
+             StartDate = col_date(format = '%Y-%m-%d'),
+             EndDate = col_date(format = '%Y-%m-%d'),
+             StartTime = col_time(format = '%H:%M'),
+             EndTime = col_time(format = '%H:%M'),
+             HourNum = col_double()
+           )
+  ) %>%
+  as_tibble()
+
+escooters_postcovid <-
+  read_csv('raw_data/escooters-postcovid.csv',
+           col_types = cols(
+             StartDate = col_date(format = '%Y-%m-%d'),
+             EndDate = col_date(format = '%Y-%m-%d'),
+             StartTime = col_time(format = '%H:%M'),
+             EndTime = col_time(format = '%H:%M'),
+             HourNum = col_double()
+           )
+  ) %>%
+  as_tibble()
+```

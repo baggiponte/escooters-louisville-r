@@ -1,40 +1,257 @@
 ---
-title: "Louisville Dockless Vehicles"
-author: 'Luca Baggi'
-output: html_notebook
+title: 'Lousville Dockless Vehicles: Exploratory Data Analysis'
+author: "Luca Baggi"
+output:
+  html_document:
+    df_print: paged
 ---
 
 # Load packages
 
 ```{r, message=FALSE}
 library(tidyverse)
-library(tidymodels)
+
+# for enhancing ggplot
+library(ggridges)
+library(ggthemes)
+  # set a theme to stay for the rest of the plotting
+  theme_set(theme_fivethirtyeight())
 ```
 
 # Load data
 
 ```{r}
-escooters_precovid <-
-  read_csv('raw_data/escooters-precovid.csv',
-           col_types = cols(
-             StartDate = col_date(format = '%Y-%m-%d'),
-             EndDate = col_date(format = '%Y-%m-%d'),
-             StartTime = col_time(format = '%H:%M'),
-             EndTime = col_time(format = '%H:%M'),
-             HourNum = col_double()
-           )
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+
+trips <-
+  read_csv(
+    url,
+    col_types = cols(
+      StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S'),
+      EndTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+    )
+  ) %>%
+  mutate(
+    Duration = as.integer(Duration),
+    # convert in meters
+    Distance = as.integer(round(Distance * 1609)),
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # rename TripID
+    TripID = 1:length(TripID),
+    # add a dummy for short trip (with short duration and distance)
+    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
   ) %>%
   as_tibble()
 
-escooters_postcovid <-
-  read_csv('raw_data/escooters-postcovid.csv',
-           col_types = cols(
-             StartDate = col_date(format = '%Y-%m-%d'),
-             EndDate = col_date(format = '%Y-%m-%d'),
-             StartTime = col_time(format = '%H:%M'),
-             EndTime = col_time(format = '%H:%M'),
-             HourNum = col_double()
-           )
-  ) %>%
-  as_tibble()
+trips %>% head()
 ```
+
+Two features have been added:
+
+* `Covid` indicates if the trip happened during the COVID-19 emergency.
+* `ShortTrip` indicates if the trip is actually a very short one: shorter than 1 minute, with less than 100 meters run.
+
+```{r}
+trips %>%
+  count(ShortTrip) %>%
+  mutate(count = n/sum(n))
+```
+Less than 1 trip on 5 is very, very short. This may actually be a really low threshold:
+
+```{r}
+trips %>%
+  count(Covid) %>%
+  mutate(count = n/sum(n))
+```
+Only some 25.000 trips happened during COVID-19 emergency.
+
+# Boxplot
+
+## Boxplot as it is
+
+To obtain a first impression:
+
+```{r}
+trips %>%
+  ggplot(aes(x = Duration)) +
+  geom_boxplot() +
+  ggtitle('Duration Boxplot')
+
+trips %>%
+  ggplot(aes(x = Distance)) +
+  geom_boxplot() +
+  ggtitle('Distance Boxplot')
+```
+
+There are way to many outliers: we can't see anything!
+
+## Create a Filter
+
+Note that there are some values of distance which are negative: we should also deal with them.
+
+```{r}
+trips_filter <-
+  trips %>%
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 &
+    # Distance between 0 and 5km
+    Distance > 0 & Distance <= 5000
+  )
+
+trips_filter %>%
+  ggplot(aes(x = Duration)) +
+  geom_boxplot() +
+  ggtitle('Boxplot of Duration')
+
+trips_filter %>%
+  ggplot(aes(x = Duration, y = StartNH)) +
+  geom_boxplot() +
+  ggtitle('Duration, by Starting Neighborhood')
+
+trips_filter %>%
+  ggplot(aes(x = Distance)) +
+  geom_boxplot() +
+  ggtitle('Boxplot of Distance')
+
+trips_filter %>%
+  ggplot(aes(x = Distance, y = StartNH)) +
+  geom_boxplot() +
+  ggtitle('Distance, by Starting Neighborhood')
+```
+
+Filtering is almost always arbitrary. Here we are not conservative at all especially because we are left nonetheless with more than 350.000 observations - a real challenge for our hardware to process!
+
+However, there are theoretical reasons behind this nonetheless: trips lasting longer than half an hour seem suspicious - we would need idle time to make a more thorough analysis. The `distance` threshold is not varying very much: only some 10.000 observations get eliminated. This will result in cleaner histograms.
+
+This will indeed underrepresent trips from the outermost neighbourhoods, but we would delete most of these regardless.
+
+## Pivot Long Boxplot
+
+But this on its own is not really informing: what can we say about the underlying distribution?
+
+Let's pivot to a longer table:
+
+```{r}
+trips_long <-
+  trips_filter %>%
+  # select only the rows we need
+  select(TripID, Duration, Distance, StartNH, EndNH, Covid, ShortTrip) %>%
+  # change all factors in integers, otherwise the pivot fails
+  # using across() + where() instead of mutate_if, as lifecycle is superseded:
+  mutate(across(where(is.factor), as.integer)) %>%
+  # pivot to longer:
+  pivot_longer(
+    # spec the col we want to leave as it is:
+    cols = !TripID,
+    # define the name of the 'supercolumn' with the classes:
+    names_to = 'Class',
+    # define the name of the column with all the values:
+    values_to = 'Values'
+  )
+
+trips_long %>%
+  head()
+```
+
+Then we can create some better plots:
+
+```{r}
+trips_long %>%
+  ggplot(aes(Values, Class)) +
+  geom_boxplot()
+```
+
+Of course, these are not very informative: `Distance` is so broad that in comparison all other values shrink. Also, binary factors are pretty useless in a boxplot! To obtain more info, now, we may want to look at histogram and ridges.
+
+
+
+# Histograms
+
+```{r}
+trips_filter %>%
+  ggplot(aes(x = Distance)) +
+  geom_histogram(fill = 'darkseagreen', bins = 60) +
+  ggtitle('Distance Histogram')
+
+trips_filter %>%
+  ggplot(aes(x = Duration)) +
+  geom_histogram(fill = 'cornflowerblue', bins = 30) +
+  ggtitle('Duration Histogram')
+```
+But on their own these aren't very informative. We might want to see if COVID-19 has any effects:
+
+```{r}
+trips_filter %>%
+  ggplot(aes(x = Distance, fill = Covid)) +
+  geom_histogram(bins = 60, alpha = 0.6)
+
+trips_filter %>%
+  ggplot(aes(x = Duration, fill = Covid)) +
+  geom_histogram(bins = 60, alpha = 0.6)
+```
+It turns out, this does not tell very much!
+
+# COVID-19: Ridges, Histogram, Densities
+
+With `ggridges`, we can plot these:
+
+```{r}
+trips_filter %>%
+  ggplot(aes(x = Distance, y = Covid)) +
+  geom_density_ridges() +
+  ggtitle('Distance: effects of COVID-19') +
+  ylab('0: no COVID-19')
+
+trips_filter %>%
+  ggplot(aes(x = Duration, y = Covid)) +
+  geom_density_ridges() +
+  ggtitle('Duration: effects of COVID-19') +
+  ylab('0: no COVID-19')
+```
+
+Clearly COVID-19 shifts escooters usage. We can formulate a couple of hypotheses, which we won't be statistically testing:
+
+1. COVID-19 reduces the trip distance.
+2. COVID-19 however seems to have increased the variance of the trip duration.
+
+```{r}
+trips_filter %>%
+  filter(Covid == 0) %>%
+  ggplot(aes(Duration, fill = ShortTrip)) +
+  geom_histogram(alpha = 0.8) +
+  ggtitle('Duration without COVID-19')
+
+trips_filter %>%
+  filter(Covid == 1) %>%
+  ggplot(aes(Duration, fill = ShortTrip)) +
+  geom_histogram(alpha = 0.8) +
+  ggtitle('Duration with COVID-19')
+```
+
+```{r}
+trips_filter %>%
+  filter(Covid == 0) %>%
+  ggplot(aes(Distance, fill = ShortTrip)) +
+  geom_histogram() +
+  ggtitle('Distance without COVID-19')
+
+trips_filter %>%
+  filter(Covid == 1) %>%
+  ggplot(aes(Distance, fill = ShortTrip)) +
+  geom_histogram() +
+  ggtitle('Distance with COVID-19')
+```
+
+Quite the contrary, it seems that the duration of longer trips is the only feature to have diminished. To really test that, we would need to control for the time period where the trips actually happened!
+
+# Other considerations
+
+In order to examine time effects (with circular barplots, for instance) we will have to `group_by` the data, e.g. hourly, and sum (or average) over `Distance` and `Duration`. This is beyond the scope of our analysis, as of now. What we can do, instead, is to try and plot the flow from one neighbourhood to the other.
+
+
+

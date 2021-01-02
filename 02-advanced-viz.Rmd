@@ -1,0 +1,55 @@
+---
+title: "Louisville Dockless Vehicles: Advanced Visualisation"
+output: html_notebook
+---
+
+# Load Packages
+
+```{r, message=FALSE}
+library(tidyverse)
+library(circlize)
+```
+
+# Load Data
+
+From before, we did:
+
+```{r}
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+
+trips <-
+  # read the data
+  read_csv(url, col_types = cols(
+      StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S'),
+      EndTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+    )
+  ) %>%
+  # manipulate cols:
+  mutate(
+    Duration = as.integer(Duration),
+    # convert in meters
+    Distance = as.integer(round(Distance * 1609)),
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # recode TripID
+    TripID = 1:length(TripID),
+    # add a dummy for short trip (with short duration and distance)
+    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  # remove the outliers
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 &
+    # Distance between 0 and 5km
+    Distance > 0 & Distance <= 5000
+  ) %>%
+  as_tibble()
+
+trips %>% head()
+```
+
+# Visualize with a chord diagram
+

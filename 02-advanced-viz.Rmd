@@ -1,5 +1,6 @@
 ---
 title: "Louisville Dockless Vehicles: Advanced Visualisation"
+author: 'Luca Baggi'
 output: html_notebook
 ---
 
@@ -7,6 +8,12 @@ output: html_notebook
 
 ```{r, message=FALSE}
 library(tidyverse)
+
+# alluvial/senkey plots
+library(networkD3)
+library(ggalluvial)
+
+# chord plots
 library(circlize)
 ```
 
@@ -51,5 +58,210 @@ trips <-
 trips %>% head()
 ```
 
-# Visualize with a chord diagram
+# Data Wrangling
+
+Before plotting, we need to work with the two way frequency table:
+
+```{r}
+trips %>%
+  select(StartNH) %>%
+  table() %>%
+  sort() %>%
+  as_tibble()
+
+trips %>%
+  select(EndNH) %>%
+  table() %>%
+  sort() %>%
+  as_tibble()
+```
+
+## Twoway Frequency Table
+
+```{r}
+twoway_freq <-
+  trips %>%
+  select(StartNH, EndNH) %>%
+  table() %>%
+  as_tibble() %>%
+  # remove the null combinations
+  filter(n != 0) %>%
+  arrange(desc(n))
+
+twoway_freq
+```
+
+# Senkey Diagram
+
+## Create the nodes
+
+This already has the desired long format of origin-destination, so we can directly work with the Senkey diagram. To reduce dimensionality, we might want to filter the values.
+
+```{r}
+twoway <-
+  trips %>%
+  select(StartNH, EndNH) %>%
+  table() %>%
+  as_tibble() %>%
+  arrange(desc(n)) %>%
+  filter(n > 1000) %>%
+  mutate(
+    EndNH = paste0(EndNH, ' ')
+  )
+
+twoway
+```
+
+What does the last line accomplish? Let's see in the following code chunks. Let's create a `nodes` dataframe:
+
+```{r}
+nodes <-
+  data.frame(
+    node = c(twoway$StartNH, twoway$EndNH)
+  ) %>%
+  unique()
+
+nodes
+```
+
+This has created a `nodes` dataframe, which we will use as a base to create the diagram. Adding the trailing whitespace at the end of `twoway$EndNH` made the `nodes` dataframe twice as long, creating objectively different classes of start and end. This is useful because otherwise the diagram would have flows going back to the same neighbourhood (and we want it to look nicer).
+
+## Using `networkD3`
+
+Finally, we can apply `match` to `twoway` and draw the plot:
+
+```{r}
+twoway %>%
+  mutate(
+    # create two numeric columns for the nodes (think of them as dummies)
+    origin = match(twoway$StartNH, nodes$node) - 1,
+    destination = match(twoway$StartNH, nodes$node) - 1,
+  ) %>%
+  as.data.frame() %>%
+  sankeyNetwork(
+    # Links = twoway is unneded, thanks to the pipe
+    Nodes = nodes,
+    Source = 'origin',
+    Target = 'destination',
+    Value = 'n',
+    # this belongs to the nodes dataframe
+    NodeID = 'node',
+    nodeWidth=40, fontSize=13, nodePadding=20
+  )
+```
+
+Aaaand of course, it does not work.
+
+## Using `ggalluvial`
+
+Perhaps it is better to use a different tool. Enter `ggalluvial` and hope for the best.
+
+```{r}
+twoway %>%
+  ggplot(aes(
+    axis1 = StartNH,
+    axis2 = EndNH,
+    y = n
+  )) +
+  scale_x_discrete(limits = c("StartNH", "EndNH"), expand = c(.2, .05)) +
+  xlab("Start and End Neighbourhood") +
+  geom_alluvium(aes(fill = n)) +
+  geom_stratum() +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)))
+```
+
+# Drawing a Chord Plot
+
+The matrix we are going to use is still the two-way frequency table (or, in proper terms, adjacency matrix).
+
+## Define some helper functions:
+
+It is already in the `long` format, so we can start plotting straight away. Let's just rewrite the levels of both columns to make them easier to fit. Since we will be using this more than once, we can define this as a function:
+
+```{r}
+prep_cord_data <- function(freq_table) {
+  freq_table %>%
+  transmute(
+    StartNH = as.integer(as.factor(StartNH)),
+    EndNH = as.integer(as.factor(EndNH))
+  ) %>%
+  bind_cols(freq_table %>% select(n)) %>%
+  arrange(StartNH, EndNH)
+}
+  
+```
+
+Then we create the chord diagram:
+
+```{r}
+# not compatible in tidy grammar, sigh
+
+circos.clear() # reset params
+
+circos.par( # set a bunch of stuff
+  start.degree = 90,
+  gap.degree = 4,
+  track.margin = c(-0.1, 0.1),
+  points.overflow.warning = FALSE
+)
+
+# set plot parameters:
+par(mar = # margins
+      rep(0,4)) # 0 repeated 4 times
+```
+
+Then create the base plot. But we may define a function for this, so that it's easier to use it later:
+
+```{r}
+# base plot
+
+chord_plot <- function(my_data) {
+  
+  chordDiagram(
+    x = my_data, 
+    transparency = 0.25,
+    directional = 1,
+    direction.type = c("arrows", "diffHeight"), 
+    diffHeight  = -0.04,
+    annotationTrack = "grid", 
+    annotationTrackHeight = c(0.05, 0.1),
+    link.arr.type = "big.arrow", 
+    link.sort = TRUE, 
+    link.largest.ontop = TRUE)
+  
+  # text and axis
+  circos.trackPlotRegion(
+    track.index = 1, 
+    bg.border = NA, 
+    panel.fun = function(x, y) {
+      
+      xlim = get.cell.meta.data("xlim")
+      sector.index = get.cell.meta.data("sector.index")
+      
+      # Add names to the sector
+      circos.text(
+        x = mean(xlim), 
+        y = 3.2, 
+        labels = sector.index, 
+        facing = "bending", 
+        cex = 0.8
+        )
+    }
+  )
+}
+
+```
+
+## Plot the Chord Diagrams
+
+```{r}
+twoway_freq %>%
+  prep_cord_data() %>%
+  chord_plot()
+
+twoway %>%
+  prep_cord_data() %>%
+  chord_plot()
+```
+
 

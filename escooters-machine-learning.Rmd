@@ -4,19 +4,28 @@ author: 'Luca Baggi'
 output: html_notebook
 ---
 
-# Load packages
+# Load Packages
 
 ```{r, message=FALSE}
 library(tidymodels)
 library(tidyverse)
 
+# for skimming data
+library(skimr)
+
+# for plotting
+library(circlize)
+
 # for downsampling:
 library(themis)
+
+# for visualising importance of predictors
+library(vip)
 ```
 
 Then proceed to importing the data.
 
-# Import data
+# Import Data
 
 ```{r}
 url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
@@ -28,21 +37,6 @@ trips <-
       EndTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
     )
   ) %>%
-  # manipulate cols:
-  mutate(
-    Duration = as.integer(Duration),
-    # convert in meters
-    Distance = as.integer(round(Distance * 1609)),
-    # turn into factors
-    StartNH = as.factor(StartNH),
-    EndNH = as.factor(EndNH),
-    # recode TripID
-    TripID = 1:length(TripID),
-    # add a dummy for short trip (with short duration and distance)
-    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
-    # first covid death reported is on March 21st, 2020
-    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
-  ) %>%
   # remove the outliers
   filter(
     # Duration between 0 and 30 minutes
@@ -50,20 +44,40 @@ trips <-
     # Distance between 0 and 5km
     Distance > 0 & Distance <= 5000
   ) %>%
+  # remove unneded cols
+  select(-TripID, -EndTime) %>%
+  # manipulate cols:
+  mutate(
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # add a dummy for short trip (with short duration and distance)
+    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  select(-Duration, -Distance) %>%
   as_tibble()
-
-trips %>% head()
 ```
+
+And to visualise it:
+
+```{r}
+skim(trips)
+```
+
 
 Let's test a groupby (literally the same thing as creating a twoway frequency table, but keeps the coltypes!)
 
 ```{r}
+# groupby frequency table
 trips %>%
   mutate(count = 1) %>%
   group_by(StartNH, EndNH) %>%
   summarise(n = sum(count)) %>%
   arrange(desc(n))
 
+# regular frequency table
 trips %>%
   select(StartNH, EndNH) %>%
   table() %>%
@@ -73,7 +87,7 @@ trips %>%
 ```
 Now let's use these to do a bit of feature engineering.
 
-# Some wrangling
+# Some Feature Engineering
 
 Experiment with `forcats`:
 
@@ -102,7 +116,7 @@ freq_table <-
   mutate(
     # select those with p > 10e-02
     start_nh = fct_lump(StartNH, 5),
-    end_nh = fct_lump(EndNH, 7)
+    end_nh = fct_lump(EndNH, 5)
   ) %>%
   # add a count col
   mutate(count = 1) %>%
@@ -114,7 +128,7 @@ freq_table
 ```
 This seems much cleaner now! We can plot the result. We can use a `chord diagram` and the data is already in the `long` format.
 
-# Visualising the data
+# Visualising the Data
 
 ## Auxiliary function & Chord Plot params
 
@@ -183,40 +197,24 @@ freq_table %>%
   chord_plot()
 ```
 
-# Statistical Learning - Classification and Regression
+# Classification Setting
 
 Let's wrap up and start building a ML model. We split the data in two to make a classification and a regression problem.
 
 ```{r}
-df <- trips %>%
+nh_trips <- trips %>%
   # reduce the number of levels in the factor features
   mutate(
     # select those with p > 10e-02
     StartNH = fct_lump(StartNH, 5),
     EndNH = fct_lump(EndNH, 5)
-  )
-
-nh_trips <- df %>%
-  # select only features related to neighbourhoods
-  select(TripID, # only as identifier
-         Duration, Distance, EndTime,# wont'be used: contain info about the end point
-         StartTime, # will be split into dummies
-         StartNH,
-         EndNH, # target
-         ShortTrip, Covid # other dummies
-  )
-
-lonlat_trips <- df %>%
-  # select only features related to coordinates (lon-lat)
-  select(TripID,
-         Duration, Distance, EndTime,
-         StartTime,
-         StartLatitude, StartLongitude,
-         EndLatitude, EndLongitude,
-         ShortTrip, Covid)
+  ) %>%
+  select(-EndLongitude, -EndLatitude,
+         # actually, this is an ex-post variable as well!
+         -ShortTrip)
 ```
 
-It is very likely that we will not use `EndTime`, `Duration` and `Distance` as they already contain information about the end point!
+It is very likely that we will not use `EndTime`, `Duration`, `Distance` and `ShortTrip`, as they already contain information about the end point. We drop end coordinates as well, as they may be useful for regression. Starting coordinates may be an additional feature to include, though. For the meantime, let's focus on classification.
 
 # Split in Train and Test Data
 
@@ -267,16 +265,14 @@ Let's define a recipe to address this problem. We shall `downsample` the data, w
 ```{r}
 nh_recipe <- nh_train %>%
   recipe(EndNH ~ .) %>%
-  # define identifier variable
-  update_role(TripID, new_role =  'id') %>%
-  # quantities only know at the end of the trip
-  update_role(EndTime, Duration, Distance, new_role = 'ex-post') %>%
   # problem: step_date does not extract times!
   step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
   # turn it into a factor
   step_string2factor(HourNum) %>%
   # create factors out of StartTime
   step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # create holiday dummy:
+  step_holiday(StartTime, holidays = timeDate::listHolidays("US")) %>%
   # remove StartTime col
   step_rm(StartTime) %>%
   # turn factor-features into binary dummies (i.e. one per column: 1-0):
@@ -298,9 +294,62 @@ trips %>%
 
 In the last step, by setting `under_ratio = 1` we bring the number of samples of all majority classes equal to 100% of the minority class, in this case `other`. This seems reasonable, as `Downtown` is more than 10 times more frequent than `other`. Now we can start thinking of our models!
 
-# Model specification
+# Logistic Regression
+
+## Model Specification
 
 ```{r}
+logistic_model <- logistic_reg() %>%
+  set_engine('glmnet')
+  # specifying the mode is unnecessary: logistic only do classification
+```
 
+Then we create a workflow:
+
+```{r logistic-workflow}
+logistic_workflow <- workflow() %>%
+  add_recipe(nh_recipe) %>%
+  add_model(logistic_model)
+
+logistic_workflow
+```
+
+## Model Fitting
+
+```{r}
+logistic_fit <- logistic_workflow %>%
+  fit(data = nh_train)
+```
+
+And extract the results:
+
+```{r}
+logistic_fit %>%
+  pull_workflow_fit() %>%
+  tidy()
+```
+
+## Predictions
+
+Just a function's call:
+
+```{r}
+logistic_predictions <- logistic_fit %>%
+  # bind cols of the predicted class
+  multi_predict(nh_test) %>%
+  # bind the actual outcome
+  bind_cols(nh_test %>% select(EndNH))
+
+logistic_predictions
+```
+
+## Model Evaluation
+
+Let's start with the confusion matrix:
+
+```{r}
+logistic_predictions %>%
+  conf_mat(EndNH, .pred_class) %>%
+  autoplot(type = 'heatmap')
 ```
 

@@ -1,0 +1,306 @@
+---
+title: "ML test"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load packages
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+
+# for downsampling:
+library(themis)
+```
+
+Then proceed to importing the data.
+
+# Import data
+
+```{r}
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+
+trips <-
+  # read the data
+  read_csv(url, col_types = cols(
+      StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S'),
+      EndTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+    )
+  ) %>%
+  # manipulate cols:
+  mutate(
+    Duration = as.integer(Duration),
+    # convert in meters
+    Distance = as.integer(round(Distance * 1609)),
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # recode TripID
+    TripID = 1:length(TripID),
+    # add a dummy for short trip (with short duration and distance)
+    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  # remove the outliers
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 &
+    # Distance between 0 and 5km
+    Distance > 0 & Distance <= 5000
+  ) %>%
+  as_tibble()
+
+trips %>% head()
+```
+
+Let's test a groupby (literally the same thing as creating a twoway frequency table, but keeps the coltypes!)
+
+```{r}
+trips %>%
+  mutate(count = 1) %>%
+  group_by(StartNH, EndNH) %>%
+  summarise(n = sum(count)) %>%
+  arrange(desc(n))
+
+trips %>%
+  select(StartNH, EndNH) %>%
+  table() %>%
+  as_tibble() %>%
+  arrange(desc(n)) %>%
+  filter(n != 0)
+```
+Now let's use these to do a bit of feature engineering.
+
+# Some wrangling
+
+Experiment with `forcats`:
+
+```{r}
+trips %>%
+  # not select()!
+  pull(StartNH) %>%
+  fct_count(prop = T) %>%
+  arrange(desc(n)) %>%
+  as_tibble()
+
+trips %>%
+  # not select()!
+  pull(EndNH) %>%
+  fct_count(prop = T) %>%
+  arrange(desc(n)) %>%
+  as_tibble()
+```
+## Select top factors
+
+We can use `fct_lump()` to select the top `n` factors:
+
+```{r}
+freq_table <-
+  trips %>%
+  mutate(
+    # select those with p > 10e-02
+    start_nh = fct_lump(StartNH, 5),
+    end_nh = fct_lump(EndNH, 7)
+  ) %>%
+  # add a count col
+  mutate(count = 1) %>%
+  group_by(start_nh, end_nh) %>%
+  summarise(n = sum(count)) %>%
+  arrange(start_nh)
+
+freq_table
+```
+This seems much cleaner now! We can plot the result. We can use a `chord diagram` and the data is already in the `long` format.
+
+# Visualising the data
+
+## Auxiliary function & Chord Plot params
+
+```{r}
+# adjust parameters:
+
+circos.clear() # reset params
+
+circos.par( # set a bunch of stuff
+  start.degree = 90,
+  gap.degree = 4,
+  track.margin = c(-0.1, 0.1),
+  points.overflow.warning = FALSE
+)
+
+# set plot parameters:
+par(mar = # margins
+      rep(0,4)) # 0 repeated 4 times
+
+# create an auxiliary function
+chord_plot <- function(my_data) {
+  
+  chordDiagram(
+    x = my_data, 
+    transparency = 0.25,
+    directional = 1,
+    direction.type = c("arrows", "diffHeight"), 
+    diffHeight  = -0.04,
+    annotationTrack = "grid", 
+    annotationTrackHeight = c(0.05, 0.1),
+    link.arr.type = "big.arrow", 
+    link.sort = TRUE, 
+    link.largest.ontop = TRUE)
+  
+  # text and axis
+  circos.trackPlotRegion(
+    track.index = 1, 
+    bg.border = NA, 
+    panel.fun = function(x, y) {
+      
+      xlim = get.cell.meta.data("xlim")
+      sector.index = get.cell.meta.data("sector.index")
+      
+      # Add names to the sector
+      circos.text(
+        x = mean(xlim), 
+        y = 3.2, 
+        labels = sector.index, 
+        facing = "bending", 
+        cex = 0.8
+        )
+    }
+  )
+}
+```
+
+## Chord Plot
+
+```{r}
+freq_table %>%
+  transmute(
+    start_nh = as.integer(start_nh),
+    end_nh = as.integer(end_nh),
+  ) %>%
+  bind_cols(freq_table$n) %>%
+  chord_plot()
+```
+
+# Statistical Learning - Classification and Regression
+
+Let's wrap up and start building a ML model. We split the data in two to make a classification and a regression problem.
+
+```{r}
+df <- trips %>%
+  # reduce the number of levels in the factor features
+  mutate(
+    # select those with p > 10e-02
+    StartNH = fct_lump(StartNH, 5),
+    EndNH = fct_lump(EndNH, 5)
+  )
+
+nh_trips <- df %>%
+  # select only features related to neighbourhoods
+  select(TripID, # only as identifier
+         Duration, Distance, EndTime,# wont'be used: contain info about the end point
+         StartTime, # will be split into dummies
+         StartNH,
+         EndNH, # target
+         ShortTrip, Covid # other dummies
+  )
+
+lonlat_trips <- df %>%
+  # select only features related to coordinates (lon-lat)
+  select(TripID,
+         Duration, Distance, EndTime,
+         StartTime,
+         StartLatitude, StartLongitude,
+         EndLatitude, EndLongitude,
+         ShortTrip, Covid)
+```
+
+It is very likely that we will not use `EndTime`, `Duration` and `Distance` as they already contain information about the end point!
+
+# Split in Train and Test Data
+
+As we noticed above, there is a real class imbalance.
+
+```{r}
+nh_trips %>%
+  count(StartNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+nh_trips %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+```{r}
+set.seed(42)
+
+nh_split <- initial_split(nh_trips, strata = EndNH)
+
+nh_train <- training(nh_split)
+nh_test <- testing(nh_split)
+```
+
+Let's check proportions:
+
+```{r}
+nh_train %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+nh_test %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+# Define a recipe
+
+Let's define a recipe to address this problem. We shall `downsample` the data, which would achieve two goals:
+
+1. Address class imbalance.
+2. Reduce computational workload, given our limited resources.
+
+```{r}
+nh_recipe <- nh_train %>%
+  recipe(EndNH ~ .) %>%
+  # define identifier variable
+  update_role(TripID, new_role =  'id') %>%
+  # quantities only know at the end of the trip
+  update_role(EndTime, Duration, Distance, new_role = 'ex-post') %>%
+  # problem: step_date does not extract times!
+  step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
+  # turn it into a factor
+  step_string2factor(HourNum) %>%
+  # create factors out of StartTime
+  step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # remove StartTime col
+  step_rm(StartTime) %>%
+  # turn factor-features into binary dummies (i.e. one per column: 1-0):
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # remove predictors with zero variance:
+  step_zv(all_predictors()) %>%
+  # downsample the data
+  themis::step_downsample(EndNH, under_ratio = 1)
+```
+
+Note: `step_mutate(...)`is the same as the following:
+
+```
+trips %>%
+  mutate(
+    HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')
+  )
+```
+
+In the last step, by setting `under_ratio = 1` we bring the number of samples of all majority classes equal to 100% of the minority class, in this case `other`. This seems reasonable, as `Downtown` is more than 10 times more frequent than `other`. Now we can start thinking of our models!
+
+# Model specification
+
+```{r}
+
+```
+

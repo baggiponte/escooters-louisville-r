@@ -1,0 +1,234 @@
+---
+title: "Escooters: Predictive Modelling"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load Packages
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+
+# for skimming data
+library(skimr)
+
+# for downsampling
+library(themis)
+
+# for visualising importance of predictors
+library(vip)
+```
+
+Then proceed to importing the data.
+
+# Data and Final Feature Engineering
+
+```{r}
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+
+trips <-
+  # read the data
+  read_csv(url, col_types = cols(
+    StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+  )) %>%
+  # remove unneded cols
+  select(-TripID, -EndTime) %>%
+  # remove the outliers
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 &
+      # Distance between 0 and 5km
+      Distance > 0 & Distance <= 5000
+  ) %>%
+  # manipulate cols:
+  mutate(
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  # reduce the number of levels in the factor features
+  mutate(
+    # select those with p > 10e-02
+    StartNH = fct_lump(StartNH, 5),
+    EndNH = fct_lump(EndNH, 5)
+  ) %>%
+  select(-Duration, -Distance,
+         -EndLongitude, -EndLatitude
+  ) %>%
+  as_tibble()
+```
+
+And to visualise it:
+
+```{r}
+skim(trips)
+```
+
+
+Let's use a groupby (literally the same thing as creating a twoway frequency table, but keeps the coltypes!) to visualise the class imbalance:
+
+```{r}
+# groupby frequency table
+trips %>%
+  mutate(count = 1) %>%
+  group_by(StartNH, EndNH) %>%
+  summarise(n = sum(count)) %>%
+  arrange(desc(n))
+```
+
+# Split in Train and Test Data
+
+Class imbalance leads to stratified sampling:
+
+```{r}
+set.seed(42)
+
+trips_split <- initial_split(trips, strata = EndNH)
+
+trips_train <- training(trips_split)
+trips_test <- testing(trips_split)
+```
+
+Let's check proportions:
+
+```{r}
+trips_train %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+trips_test %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+# Define a recipe
+
+Let's define a recipe to address this problem. We shall `downsample` the data, which would achieve two goals:
+
+1. Address class imbalance.
+2. Reduce computational workload, given our limited resources.
+
+```{r}
+trips_recipe <- trips_train %>%
+  recipe(EndNH ~ .) %>%
+  # problem: step_date does not extract times!
+  step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
+  # turn it into a factor
+  step_string2factor(HourNum) %>%
+  # create factors out of StartTime
+  step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # create holiday dummy:
+  step_holiday(StartTime, holidays = timeDate::listHolidays("US")) %>%
+  # remove StartTime col
+  step_rm(StartTime) %>%
+  # turn factor-features into binary dummies (i.e. one per column: 1-0):
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # remove predictors with zero variance:
+  step_zv(all_predictors()) %>%
+  # downsample the data
+  themis::step_downsample(EndNH, under_ratio = 1)
+```
+
+Note: `step_mutate(...)`is the same as the following:
+
+```
+trips %>%
+  mutate(
+    HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')
+  )
+```
+
+In the last step, by setting `under_ratio` we bring the number of samples of all majority classes equal to some percentage of the minority class, in this case `other`. This seems reasonable, as `Downtown` is more than 10 times more frequent than `other`. While we may want to use the package `tune` to choose the appropriate `under_ratio`, due to some hardware constraints we have to give up.
+
+Now we can start thinking of our models!
+
+# Logistic Regression
+
+## Model Specification
+
+Normally, to specify a logistic regression, one would use `logistic_reg()`, perhaps with the engine `glm`. However, for multinomial regressions one must use `multinom_reg()` and said engine is unavailable:
+
+```{r}
+show_engines('multinom_reg')
+```
+
+Specifying the `mode` is redundant: the only one available is `classification`, as one can see above.
+
+```{r}
+logistic_model <- multinom_reg(penalty = 0) %>%
+  set_engine('glmnet') # this is actually the default
+```
+
+Then we create a workflow:
+
+```{r logistic-workflow}
+logistic_workflow <- workflow() %>%
+  add_recipe(trips_recipe) %>%
+  add_model(logistic_model)
+
+logistic_workflow
+```
+
+## Model Fitting
+
+```{r}
+logistic_fit <- logistic_workflow %>%
+  fit(data = trips_train)
+```
+
+And extract the results:
+
+```{r}
+logistic_fit %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  select(-penalty)
+```
+
+Let's see the contribution of each variable:
+
+```{r}
+logistic_fit %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+
+This is unexpected! Results can be improved by `tuning` the `penalty` hyperparameter (Multinomial Lasso/Ridge/ElasticNet).
+
+## Predictions
+
+Just a function's call:
+
+```{r}
+logistic_predictions <- logistic_fit %>%
+  # bind cols with classes predicted probabilites
+  predict(trips_test) %>%
+  # bind the actual outcome
+  bind_cols(trips_test %>% select(EndNH))
+
+logistic_predictions
+```
+
+## Model Evaluation
+
+Unfortunately, collecting the metrics with `collect_metrics()` can't be done with `multinomial_reg()` (yet). Let's start with the confusion matrix:
+
+```{r}
+logistic_predictions %>%
+  conf_mat(EndNH, .pred_class) %>%
+  autoplot(type = 'heatmap')
+```
+
+Unfortunately, collecting the metrics with `collect_metrics()` can't be done with `multinomial_reg()` (yet).
+
+```{r}
+logistic_predictions %>%
+  accuracy(EndNH, .pred_class)
+```
+
+Not as bad as I initially thought!

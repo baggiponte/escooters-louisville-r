@@ -1,0 +1,449 @@
+---
+title: "ML test"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load Packages
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+
+# for skimming data
+library(skimr)
+
+# for plotting
+library(circlize)
+
+# for downsampling
+library(themis)
+
+# for visualising importance of predictors
+library(vip)
+library(dotwhisker)
+```
+
+Then proceed to importing the data.
+
+# Import Data
+
+```{r}
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+
+trips <-
+  # read the data
+  read_csv(url, col_types = cols(
+      StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S'),
+      EndTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+    )
+  ) %>%
+  # remove the outliers
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 &
+    # Distance between 0 and 5km
+    Distance > 0 & Distance <= 5000
+  ) %>%
+  # remove unneded cols
+  select(-TripID, -EndTime) %>%
+  # manipulate cols:
+  mutate(
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # add a dummy for short trip (with short duration and distance)
+    ShortTrip = as.factor(ifelse((Duration <= 1 | Distance <= 100), 1, 0)),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  select(-Duration, -Distance) %>%
+  as_tibble()
+```
+
+And to visualise it:
+
+```{r}
+skim(trips)
+```
+
+
+Let's test a groupby (literally the same thing as creating a twoway frequency table, but keeps the coltypes!)
+
+```{r}
+# groupby frequency table
+trips %>%
+  mutate(count = 1) %>%
+  group_by(StartNH, EndNH) %>%
+  summarise(n = sum(count)) %>%
+  arrange(desc(n))
+
+# regular frequency table
+trips %>%
+  select(StartNH, EndNH) %>%
+  table() %>%
+  as_tibble() %>%
+  arrange(desc(n)) %>%
+  filter(n != 0)
+```
+Now let's use these to do a bit of feature engineering.
+
+# Some Feature Engineering
+
+Experiment with `forcats`:
+
+```{r}
+trips %>%
+  # not select()!
+  pull(StartNH) %>%
+  fct_count(prop = T) %>%
+  arrange(desc(n)) %>%
+  as_tibble()
+
+trips %>%
+  # not select()!
+  pull(EndNH) %>%
+  fct_count(prop = T) %>%
+  arrange(desc(n)) %>%
+  as_tibble()
+```
+## Select top factors
+
+We can use `fct_lump()` to select the top `n = 5` factors:
+
+```{r}
+freq_table <-
+  trips %>%
+  mutate(
+    # select those with p > 10e-02
+    start_nh = fct_lump(StartNH, 5),
+    end_nh = fct_lump(EndNH, 5)
+  ) %>%
+  # add a count col
+  mutate(count = 1) %>%
+  group_by(start_nh, end_nh) %>%
+  summarise(n = sum(count)) %>%
+  arrange(start_nh)
+
+freq_table
+```
+This seems much cleaner now! We can plot the result. We can use a `chord diagram` and the data is already in the `long` format.
+
+# Visualising the Data
+
+## Auxiliary function & Chord Plot params
+
+```{r}
+# adjust parameters:
+
+circos.clear() # reset params
+
+circos.par( # set a bunch of stuff
+  start.degree = 90,
+  gap.degree = 4,
+  track.margin = c(-0.1, 0.1),
+  points.overflow.warning = FALSE
+)
+
+# set plot parameters:
+par(mar = # margins
+      rep(0,4)) # 0 repeated 4 times
+
+# create an auxiliary function
+chord_plot <- function(my_data) {
+  
+  chordDiagram(
+    x = my_data, 
+    transparency = 0.25,
+    directional = 1,
+    direction.type = c("arrows", "diffHeight"), 
+    diffHeight  = -0.04,
+    annotationTrack = "grid", 
+    annotationTrackHeight = c(0.05, 0.1),
+    link.arr.type = "big.arrow", 
+    link.sort = TRUE, 
+    link.largest.ontop = TRUE)
+  
+  # text and axis
+  circos.trackPlotRegion(
+    track.index = 1, 
+    bg.border = NA, 
+    panel.fun = function(x, y) {
+      
+      xlim = get.cell.meta.data("xlim")
+      sector.index = get.cell.meta.data("sector.index")
+      
+      # Add names to the sector
+      circos.text(
+        x = mean(xlim), 
+        y = 3.2, 
+        labels = sector.index, 
+        facing = "bending", 
+        cex = 0.8
+        )
+    }
+  )
+}
+```
+
+## Chord Plot
+
+```{r}
+freq_table %>%
+  transmute(
+    start_nh = as.integer(start_nh),
+    end_nh = as.integer(end_nh),
+  ) %>%
+  bind_cols(freq_table$n) %>%
+  chord_plot()
+```
+
+# Classification Setting
+
+Let's wrap up and start building a ML model. We split the data in two to make a classification and a regression problem.
+
+```{r}
+nh_trips <- trips %>%
+  # reduce the number of levels in the factor features
+  mutate(
+    # select those with p > 10e-02
+    StartNH = fct_lump(StartNH, 5),
+    EndNH = fct_lump(EndNH, 5)
+  ) %>%
+  select(-EndLongitude, -EndLatitude,
+         # actually, this is an ex-post variable as well!
+         -ShortTrip)
+```
+
+It is very likely that we will not use `EndTime`, `Duration`, `Distance` and `ShortTrip`, as they already contain information about the end point. We drop end coordinates as well, as they may be useful for regression. Starting coordinates may be an additional feature to include, though. For the meantime, let's focus on classification.
+
+# Split in Train and Test Data
+
+As we noticed above, there is a real class imbalance.
+
+```{r}
+nh_trips %>%
+  count(StartNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+nh_trips %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+```{r}
+set.seed(42)
+
+nh_split <- initial_split(nh_trips, strata = EndNH)
+
+nh_train <- training(nh_split)
+nh_test <- testing(nh_split)
+```
+
+Let's check proportions:
+
+```{r}
+nh_train %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+nh_test %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+# Define a recipe
+
+Let's define a recipe to address this problem. We shall `downsample` the data, which would achieve two goals:
+
+1. Address class imbalance.
+2. Reduce computational workload, given our limited resources.
+
+```{r}
+nh_recipe <- nh_train %>%
+  recipe(EndNH ~ .) %>%
+  # problem: step_date does not extract times!
+  step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
+  # turn it into a factor
+  step_string2factor(HourNum) %>%
+  # create factors out of StartTime
+  step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # create holiday dummy:
+  step_holiday(StartTime, holidays = timeDate::listHolidays("US")) %>%
+  # remove StartTime col
+  step_rm(StartTime) %>%
+  # turn factor-features into binary dummies (i.e. one per column: 1-0):
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # remove predictors with zero variance:
+  step_zv(all_predictors()) %>%
+  # downsample the data
+  themis::step_downsample(EndNH, under_ratio = tune())
+```
+
+Note: `step_mutate(...)`is the same as the following:
+
+```
+trips %>%
+  mutate(
+    HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')
+  )
+```
+
+In the last step, by setting `under_ratio` we bring the number of samples of all majority classes equal to some percentage of the minority class, in this case `other`. This seems reasonable, as `Downtown` is more than 10 times more frequent than `other`. However, we may want to use the package `tune` to choose the appropriate `under_ratio`!
+
+```{r}
+nh_recipe %>%
+dials::parameters()
+```
+
+Now we can start thinking of our models!
+
+# Logistic Regression
+
+## Model Specification
+
+Normally, to specify a logistic regression, one would use `logistic_reg()`, perhaps with the engine `glm`. However, for multinomial regressions one must use `multinom_reg()` and said engine is unavailable:
+
+```{r}
+show_engines('multinom_reg')
+```
+
+Specifying the `mode` is redundant: the only one available is `classification`, as one can see above.
+
+```{r}
+logistic_model <- multinom_reg(penalty = 0) %>%
+  set_engine('glmnet') # this is actually the default
+```
+
+Then we create a workflow:
+
+```{r logistic-workflow}
+logistic_workflow <- workflow() %>%
+  add_recipe(nh_recipe) %>%
+  add_model(logistic_model)
+
+logistic_workflow
+```
+
+## Hyperparameters tuning
+
+Let's detect the number of cores on the machine:
+
+```{r}
+all_cores <- parallel::detectCores(logical = FALSE)
+
+```
+
+
+### K-Fold Cross Validation
+
+We want to tune our hyperparameters creating a 5-fold cross validation (10 would be too much for our hardware). We stratify our folds, too.
+
+```{r}
+set.seed(42)
+
+# this bit does not work on my machine
+nh_folds <-
+  vfold_cv(nh_train,
+           # if not specified, defaults to 10
+           v = 5,
+           # stratify
+           strata = 'EndNH')
+
+nh_folds
+```
+
+And let's define the range of values to tune `under_ratio`. It normally takes values in the following range:
+
+```{r}
+under_ratio()
+```
+
+So we can set up a grid like the following, using `grid_regular()` from the `tidymodels` package `dials` (more details [here](https://dials.tidymodels.org/reference/grid_regular.html)).
+
+```{r}
+under_ratio_grid <- dials::grid_regular(
+  under_ratio(),
+  levels = 5
+)
+
+```
+
+
+```{r}
+logistic_tuned <-
+  logistic_workflow %>%
+  tune_grid(
+    # specify the resamples:
+    resamples = nh_folds,
+    # spec the grid:
+    grid = under_ratio_grid
+  )
+```
+
+
+## Model Fitting
+
+```{r}
+logistic_fit <- logistic_workflow %>%
+  fit(data = nh_train)
+```
+
+And extract the results:
+
+```{r}
+logistic_fit %>%
+  pull_workflow_fit() %>%
+  tidy() %>%
+  select(-penalty)
+```
+
+Let's see the contribution of each variable:
+
+```{r}
+logistic_fit %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+
+This is unexpected.
+
+## Predictions
+
+Just a function's call:
+
+```{r}
+logistic_predictions <- logistic_fit %>%
+  # bind cols with classes predicted probabilites
+  predict(nh_test) %>%
+  # bind cols with predicted class
+  # bind_cols(logistic_fit %>% predict(nh_test)) %>%
+  # bind the actual outcome
+  bind_cols(nh_test %>% select(EndNH))
+
+logistic_predictions
+```
+
+## Model Evaluation
+
+Unfortunately, collecting the metrics with `collect_metrics()` can't be done with `multinomial_reg()` (yet). Let's start with the confusion matrix:
+
+```{r}
+logistic_predictions %>%
+  conf_mat(EndNH, .pred_class) %>%
+  autoplot(type = 'heatmap')
+```
+
+Unfortunately, collecting the metrics with `collect_metrics()` can't be done with `multinomial_reg()` (yet).
+
+```{r}
+logistic_predictions %>%
+  accuracy(EndNH, .pred_class)
+```
+
+Not as bad as I initially thought!
+# Random Forest

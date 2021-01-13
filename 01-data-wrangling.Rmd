@@ -1,27 +1,24 @@
 ---
 title: 'Lousville Dockless Vehicles: Exploratory Data Analysis'
-author: "Luca Baggi"
-output:
-  html_document:
-    df_print: paged
+author: 'Luca Baggi'
 ---
 
 # Load packages
-
 ```{r, message=FALSE}
 library(tidyverse)
 
 # for enhancing ggplot
 library(ggridges)
 library(ggthemes)
-  # set a theme to stay for the rest of the plotting
-  theme_set(theme_fivethirtyeight())
+
+# set a theme to stay for the rest of the plotting
+theme_set(theme_fivethirtyeight())
 ```
 
 # Load data
 
 ```{r}
-url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville-python/main/data/escooters_od.csv'
 
 trips <-
   read_csv(
@@ -46,8 +43,6 @@ trips <-
     Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
   ) %>%
   as_tibble()
-
-trips %>% head()
 ```
 
 Two features have been added:
@@ -55,14 +50,15 @@ Two features have been added:
 * `Covid` indicates if the trip happened during the COVID-19 emergency.
 * `ShortTrip` indicates if the trip is actually a very short one: shorter than 1 minute, with less than 100 meters run.
 
-```{r}
+```{r, echo=FALSE}
 trips %>%
   count(ShortTrip) %>%
   mutate(count = n/sum(n))
 ```
+
 Less than 1 trip on 5 is very, very short. This may actually be a really low threshold:
 
-```{r}
+```{r, echo=FALSE}
 trips %>%
   count(Covid) %>%
   mutate(count = n/sum(n))
@@ -73,19 +69,24 @@ Only some 25.000 trips happened during COVID-19 emergency.
 
 ## Boxplot as it is
 
-To obtain a first impression:
+To obtain a first impression, we can draw the boxplots of `Duration`:
 
-```{r}
+```{r, echo=FALSE}
 trips %>%
   ggplot(aes(x = Duration)) +
   geom_boxplot() +
   ggtitle('Duration Boxplot')
+```
 
+And of `Distance`:
+
+```{r, echo=FALSE}
 trips %>%
   ggplot(aes(x = Distance)) +
   geom_boxplot() +
   ggtitle('Distance Boxplot')
 ```
+
 
 There are way to many outliers: we can't see anything!
 
@@ -93,7 +94,7 @@ There are way to many outliers: we can't see anything!
 
 Note that there are some values of distance which are negative: we should also deal with them.
 
-```{r}
+```{r, echo=FALSE}
 trips_filter <-
   trips %>%
   filter(
@@ -102,7 +103,11 @@ trips_filter <-
     # Distance between 0 and 5km
     Distance > 0 & Distance <= 5000
   )
+```
 
+We choose to create a `trips_filter` dataset with `Duration` smaller than 30 minutes and `Distance` smaller than 5km.
+
+```{r}
 trips_filter %>%
   ggplot(aes(x = Duration)) +
   geom_boxplot() +
@@ -130,47 +135,9 @@ However, there are theoretical reasons behind this nonetheless: trips lasting lo
 
 This will indeed underrepresent trips from the outermost neighbourhoods, but we would delete most of these regardless.
 
-## Pivot Long Boxplot
+# Histograms for Distance and Duration
 
-But this on its own is not really informing: what can we say about the underlying distribution?
-
-Let's pivot to a longer table:
-
-```{r}
-trips_long <-
-  trips_filter %>%
-  # select only the rows we need
-  select(TripID, Duration, Distance, StartNH, EndNH, Covid, ShortTrip) %>%
-  # change all factors in integers, otherwise the pivot fails
-  # using across() + where() instead of mutate_if, as lifecycle is superseded:
-  mutate(across(where(is.factor), as.integer)) %>%
-  # pivot to longer:
-  pivot_longer(
-    # spec the col we want to leave as it is:
-    cols = !TripID,
-    # define the name of the 'supercolumn' with the classes:
-    names_to = 'Class',
-    # define the name of the column with all the values:
-    values_to = 'Values'
-  )
-
-trips_long %>%
-  head()
-```
-
-Then we can create some better plots:
-
-```{r}
-trips_long %>%
-  ggplot(aes(Values, Class)) +
-  geom_boxplot()
-```
-
-Of course, these are not very informative: `Distance` is so broad that in comparison all other values shrink. Also, binary factors are pretty useless in a boxplot! To obtain more info, now, we may want to look at histogram and ridges.
-
-
-
-# Histograms
+Getting a preliminary idea of the distributions is a good practice which allows to narrow down the interesting patterns:
 
 ```{r}
 trips_filter %>%
@@ -183,7 +150,8 @@ trips_filter %>%
   geom_histogram(fill = 'cornflowerblue', bins = 30) +
   ggtitle('Duration Histogram')
 ```
-But on their own these aren't very informative. We might want to see if COVID-19 has any effects:
+
+But on their own these graphs aren't very informative. We might want to see if COVID-19 has any effects:
 
 ```{r}
 trips_filter %>%
@@ -194,9 +162,12 @@ trips_filter %>%
   ggplot(aes(x = Duration, fill = Covid)) +
   geom_histogram(bins = 60, alpha = 0.6)
 ```
-It turns out, this does not tell very much!
 
-# COVID-19: Ridges, Histogram, Densities
+It turns out, this does not tell very much, too!
+
+# Ridges, Histogram, Densities
+
+## COVID-19 Effects
 
 With `ggridges`, we can plot these:
 
@@ -249,9 +220,20 @@ trips_filter %>%
 
 Quite the contrary, it seems that the duration of longer trips is the only feature to have diminished. To really test that, we would need to control for the time period where the trips actually happened!
 
-# Other considerations
+# Ridges and Starting Neighbourhoods
 
-In order to examine time effects (with circular barplots, for instance) we will have to `group_by` the data, e.g. hourly, and sum (or average) over `Distance` and `Duration`. This is beyond the scope of our analysis, as of now. What we can do, instead, is to try and plot the flow from one neighbourhood to the other.
+Using `ggridges`, we can plot some smoothed histograms to get the idea of the distributions for each starting neighbourhood:
 
+```{r}
+trips_filter %>%
+  ggplot(aes(x = Distance, y = StartNH)) +
+  geom_density_ridges() +
+  ggtitle('Distance by starting neighbourhood') +
+  ylab('0: no COVID-19')
 
-
+trips_filter %>%
+  ggplot(aes(x = Duration, y = StartNH)) +
+  geom_density_ridges() +
+  ggtitle('Duration by starting neighbourhood') +
+  ylab('0: no COVID-19')
+```

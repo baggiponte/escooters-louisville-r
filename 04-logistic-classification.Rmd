@@ -1,0 +1,283 @@
+---
+title: "Model 1: Logistic Regression"
+author: 'Luca Baggi'
+---
+
+# Load Packages
+
+```{r, message=FALSE}
+library(tidyverse)
+library(tidymodels)
+
+# for downsampling
+library(themis) # still a tidymodels package
+
+# for predictor importance
+library(vip)
+```
+
+# Load Data
+
+Let's load the reduced data we obtained from part 3.
+
+```{r}
+trips <-
+  read_csv('data/escooters_od_reduced.csv',
+           col_types = cols(
+            StartTime = col_datetime(format = '%Y-%m-%dT%H:%M:%SZ'),
+            Covid = col_factor()
+           ))
+```
+
+# Split in Train and Test Data
+
+Class imbalance needs to be addressed via stratified sampling:
+
+```{r}
+set.seed(42)
+
+trips_split <- initial_split(trips, strata = EndNH)
+
+trips_train <- training(trips_split)
+trips_test <- testing(trips_split)
+```
+
+Let's check proportions:
+
+```{r}
+trips_train %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+
+trips_test %>%
+  count(EndNH) %>%
+  mutate(prop = n/sum(n)) %>%
+  arrange(desc(prop))
+```
+
+# Define a Recipe
+
+Let's define a recipe to address this problem. We shall `downsample` the data, which would achieve two goals:
+
+1. Address class imbalance.
+2. Reduce computational workload, given our limited computational resources.
+
+```{r}
+recipe_trips <- trips_train %>%
+  recipe(EndNH ~ .) %>%
+  # problem: step_date does not extract times!
+  step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
+  # turn it into a factor
+  step_string2factor(HourNum) %>%
+  # create factors out of StartTime
+  step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # create holiday dummy:
+  step_holiday(StartTime, holidays = timeDate::listHolidays("US")) %>%
+  # remove StartTime col
+  step_rm(StartTime) %>%
+  # turn factor-features into binary dummies (i.e. one per column: 1-0):
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # remove predictors with zero variance:
+  step_zv(all_predictors()) %>%
+  # downsample the data: each class is as numerous as the least represented
+  themis::step_downsample(EndNH, under_ratio = tune())
+
+recipe_trips
+```
+
+In the last step, by setting `under_ratio` we bring the number of samples of all majority classes equal *at most* to some percentage of the minority class, in this case `other`. This seems reasonable, as `Downtown` is more than 10 times more frequent than `other`. But note that we did not actually set a value for `under_ratio` yet: we just set `tune()`. This is because with the package `tune` we can tune this hyperparameter as well.
+
+Now we can start thinking of our models!
+
+# Logistic Regression: Model Specification
+
+Normally, to specify a logistic regression, one would use `logistic_reg()`, perhaps with the engine `glm`. However, for multinomial regressions one must use `multinom_reg()` and said engine is unavailable:
+
+```{r}
+show_engines('multinom_reg')
+```
+
+Specifying the `mode` is redundant: the only one available is `classification`, as one can see above.
+
+```{r}
+logistic_to_tune <- multinom_reg(penalty = tune()) %>%
+  set_engine('glmnet') # this is actually the default
+
+logistic_to_tune
+```
+
+We can also set a tuning parameter for `penalty`, which control regularisation, to deal with sparsity: since there are a great deal of dummies (holidays, in particular), we might want to drop out these coefficients.
+
+There is also `mixture`, which allows to create an elastic net, balancing sparse coefficient estimation (LASSO) and regularisation (Ridge).
+
+# Combine the Recipe and the Model into a Workflow
+
+We put the recipe and the model into a workflow, to visualise the tuning parameters, among others.
+
+```{r logistic-workflow}
+logistic_tuning_workflow <- workflow() %>%
+  add_recipe(recipe_trips) %>%
+  add_model(logistic_to_tune)
+
+logistic_tuning_workflow
+```
+
+# Create the Tuning Grid
+
+Let's create a grid using the `dials` package:
+
+```{r}
+logistic_grid <- grid_regular(under_ratio(),
+                              penalty(),
+                              levels = 5)
+```
+
+# Cross Validation K-Folds
+
+We then assign the folds. `rsample` has `v = 10` as the number of folds and `repeats = 1`. We slightly tweak the configuration, stratifying by `EndNH`:
+
+```{r}
+tuning_folds <-
+  trips_train %>%
+  vfold_cv(v = 5, strata = 'EndNH')
+```
+# Hyperparameters Tuning
+
+## Cross Validation
+
+This will fit 5x5 hyperparameters combinations to 5 folds: a total of 125 models! The package also has some defaults metrics for each machine learning problem: classification and regression, plus metrics for predicted classes in classification problems.
+
+```{r, eval=FALSE}
+#code evaluation is set to false when compiling to prevent fitting each time
+
+set.seed(42)
+
+logistic_resampling <-
+  logistic_tuning_workflow %>%
+  tune_grid(
+    resamples = tuning_folds,
+    grid = logistic_grid
+  )
+
+logistic_resampling %>%
+  collect_metrics() %>%
+  arrange(desc(mean))
+```
+
+## Best Model Selection
+
+To immediately select the best models according to the metrics, we can do this:
+
+```{r}
+logistic_resampling %>%
+  show_best(metric = 'roc_auc')
+
+logistic_resampling %>%
+  show_best(metric = 'accuracy')
+```
+
+But this does not tell much. Let's plot it:
+
+```{r}
+logistic_resampling %>%
+  autoplot()
+```
+
+Which is the same as:
+
+```{r}
+logistic_resampling %>%
+  collect_metrics() %>%
+  # transform into a factor
+  mutate(under_ratio = factor(under_ratio)) %>%
+  ggplot(aes(
+    x = penalty,
+    y = mean,
+    col = under_ratio
+  )) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  # have two graphs, one for each metric
+  facet_wrap(~ .metric, scales = 'free', nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+There are some missing values because the model failed miserably at classification! The plot shows that we are indifferent between **any under ratio** (we might want to use 1.2 to keep in as much data as we can) and have **low regularisation**! Let's extract the best model:
+
+```{r}
+best_logistic_roc <-
+  logistic_resampling %>%
+  select_best('roc_auc')
+
+best_logistic_accuracy <-
+  logistic_resampling %>%
+  select_best('accuracy')
+
+best_logistic_roc
+best_logistic_accuracy
+```
+
+This confirms that we are indifferent between any `under_ratio`, but there is convergence on regularisation!
+
+# Finalise the Workflow and Last Fit
+
+```{r}
+final_logistic_workflow <-
+  logistic_tuning_workflow %>%
+  finalize_workflow(best_logistic_roc)
+
+final_logistic_workflow
+```
+
+And let's do the last fit:
+
+```{r}
+set.seed(42)
+
+logistic_last_fit <-
+  final_logistic_workflow %>%
+  last_fit(trips_split)
+
+logistic_last_fit
+```
+
+Let's get the metrics:
+
+```{r}
+logistic_last_fit %>%
+  collect_metrics()
+```
+Which, unfortunately, has lower accuracy than our train model! The ideal situation would be to display a higher test accuracy, compared to the training. Also, the missing `auc_roc` seems a bad sign. However, since we are doing multinomial classification, it is to be expected! The most we might get is a ROC measure for each class against the other, after grouping them.
+
+Let's see the contribution of each variable:
+
+```{r}
+logistic_last_fit %>%
+  pluck('.workflow', 1) %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+# Model Evaluation
+
+The program can't tell us the predictions associated with each class, but we are interested in `.pred_class`:
+
+```{r}
+logistic_last_fit %>%
+  collect_predictions() %>%
+  head()
+```
+
+But we can get a confusion matrix:
+
+```{r}
+logistic_last_fit %>%
+  collect_predictions() %>%
+  conf_mat(EndNH, .pred_class) %>%
+  autoplot(type = 'heatmap')
+```
+
+# Final Considerations:
+
+Some mismatches may be due to proximity of the destinations, which we do not account for here.

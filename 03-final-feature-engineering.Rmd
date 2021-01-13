@@ -1,0 +1,91 @@
+---
+title: "Part 3: Feature Engineering"
+author: "Luca Baggi"
+date: "13/01/2021"
+---
+
+# Load Packages
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+
+# for skimming data
+library(skimr)
+```
+
+Then proceed to importing the data.
+
+# Data and Final Feature Engineering
+
+```{r}
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville-python/main/data/escooters_od.csv'
+
+trips_full <-
+  # read the data
+  read_csv(url, col_types = cols(
+    StartTime = col_datetime(format = '%Y-%m-%d %H:%M:%S')
+  )) %>%
+  # remove columns not involved in predictions
+  select(-TripID, -EndTime) %>%
+  # remove the outliers
+  filter(
+    # Duration between 0 and 30 minutes
+    Duration > 0 & Duration <= 30 & # NOTE THE `&`
+      # Distance between 0 and 5km
+      Distance > 0 & Distance <= 5000
+  ) %>%
+  # manipulate cols:
+  mutate(
+    # turn into factors
+    StartNH = as.factor(StartNH),
+    EndNH = as.factor(EndNH),
+    # first covid death reported is on March 21st, 2020
+    Covid = as.factor(ifelse(StartTime > '2020-03-20 23:59:59', 1, 0))
+  ) %>%
+  # reduce the number of levels in the factor features
+  mutate(
+    # select those with p > 0.01
+    StartNH = fct_lump(StartNH, 5),
+    EndNH = fct_lump(EndNH, 5)
+  ) %>%
+  # remove columns that would 'spoil' the prediction
+  select(-Duration, -Distance,
+         -EndLongitude, -EndLatitude
+  ) %>%
+  as_tibble()
+```
+
+And to visualise it:
+
+```{r}
+trips_full %>%
+  skim()
+```
+
+**This is still too much for my hardware to process feasibly.** We will sample some ten thousand values and proceed. This will result in a much, much weaker model, but at least we can use multiple resampling strategies.
+
+```{r}
+set.seed(42)
+
+trips_full %>%
+  slice_sample(prop = 0.1) -> trips 
+
+trips_full %>%
+  count(EndNH) %>%
+  arrange(desc(n)) %>%
+  mutate(prop = n / sum(n))
+
+trips %>%
+  # if we put StartNH, EndNH we get a twoway freq table
+  count(EndNH) %>%
+  arrange(desc(n)) %>%
+  mutate(prop = n / sum(n))
+```
+
+Also, note an example of the [law of large numbers](https://en.wikipedia.org/wiki/Law_of_large_numbers)!
+
+```{r, include=FALSE}
+trips %>%
+  write_csv('data/escooters_od_reduced.csv')
+```

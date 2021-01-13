@@ -1,16 +1,16 @@
 ---
 title: "Louisville Dockless Vehicles: Advanced Visualisation"
 author: 'Luca Baggi'
-output: html_notebook
 ---
 
 # Load Packages
 
+Now we want to create some visualisations of the flows from `StartNH` to `EndNH`. We will use the following libraries:
+
 ```{r, message=FALSE}
 library(tidyverse)
 
-# alluvial/senkey plots
-library(networkD3)
+# alluvial and sankey plots
 library(ggalluvial)
 
 # chord plots
@@ -22,7 +22,7 @@ library(circlize)
 From before, we did:
 
 ```{r}
-url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville/main/data/escooters_od.csv'
+url = 'https://raw.githubusercontent.com/baggiponte/escooters-louisville-python/main/data/escooters_od.csv'
 
 trips <-
   # read the data
@@ -54,29 +54,11 @@ trips <-
     Distance > 0 & Distance <= 5000
   ) %>%
   as_tibble()
-
-trips %>% head()
 ```
 
 # Data Wrangling
 
-Before plotting, we need to work with the two way frequency table:
-
-```{r}
-trips %>%
-  select(StartNH) %>%
-  table() %>%
-  sort() %>%
-  as_tibble()
-
-trips %>%
-  select(EndNH) %>%
-  table() %>%
-  sort() %>%
-  as_tibble()
-```
-
-## Twoway Frequency Table
+Before plotting, we need to create the two way frequency table:
 
 ```{r}
 twoway_freq <-
@@ -91,13 +73,11 @@ twoway_freq <-
 twoway_freq
 ```
 
-# Senkey Diagram
-
-## Create the nodes
+# Senkey Diagram using `ggalluvial`
 
 This already has the desired long format of origin-destination, so we can directly work with the Senkey diagram. To reduce dimensionality, we might want to filter the values.
 
-```{r}
+```{r, echo=FALSE}
 twoway <-
   trips %>%
   select(StartNH, EndNH) %>%
@@ -109,54 +89,6 @@ twoway <-
     EndNH = paste0(EndNH, ' ')
   )
 
-twoway
-```
-
-What does the last line accomplish? Let's see in the following code chunks. Let's create a `nodes` dataframe:
-
-```{r}
-nodes <-
-  data.frame(
-    node = c(twoway$StartNH, twoway$EndNH)
-  ) %>%
-  unique()
-
-nodes
-```
-
-This has created a `nodes` dataframe, which we will use as a base to create the diagram. Adding the trailing whitespace at the end of `twoway$EndNH` made the `nodes` dataframe twice as long, creating objectively different classes of start and end. This is useful because otherwise the diagram would have flows going back to the same neighbourhood (and we want it to look nicer).
-
-## Using `networkD3`
-
-Finally, we can apply `match` to `twoway` and draw the plot:
-
-```{r}
-twoway %>%
-  mutate(
-    # create two numeric columns for the nodes (think of them as dummies)
-    origin = match(twoway$StartNH, nodes$node) - 1,
-    destination = match(twoway$StartNH, nodes$node) - 1,
-  ) %>%
-  as.data.frame() %>%
-  sankeyNetwork(
-    # Links = twoway is unneded, thanks to the pipe
-    Nodes = nodes,
-    Source = 'origin',
-    Target = 'destination',
-    Value = 'n',
-    # this belongs to the nodes dataframe
-    NodeID = 'node',
-    nodeWidth=40, fontSize=13, nodePadding=20
-  )
-```
-
-Aaaand of course, it does not work.
-
-## Using `ggalluvial`
-
-Perhaps it is better to use a different tool. Enter `ggalluvial` and hope for the best.
-
-```{r}
 twoway %>%
   ggplot(aes(
     axis1 = StartNH,
@@ -174,11 +106,11 @@ twoway %>%
 
 The matrix we are going to use is still the two-way frequency table (or, in proper terms, adjacency matrix).
 
-## Define some helper functions:
+## Define some helper functions
 
-It is already in the `long` format, so we can start plotting straight away. Let's just rewrite the levels of both columns to make them easier to fit. Since we will be using this more than once, we can define this as a function:
+We define two helper functions which will improve readability. The original code is available in the GitHub repo.
 
-```{r}
+```{r, echo=FALSE}
 prep_cord_data <- function(freq_table) {
   freq_table %>%
   transmute(
@@ -191,7 +123,7 @@ prep_cord_data <- function(freq_table) {
   
 ```
 
-Then we create the chord diagram:
+Then we initialise the chord diagram and set some more parameters:
 
 ```{r}
 # not compatible in tidy grammar, sigh
@@ -210,9 +142,9 @@ par(mar = # margins
       rep(0,4)) # 0 repeated 4 times
 ```
 
-Then create the base plot. But we may define a function for this, so that it's easier to use it later:
+And then proceed with the creation of the plot. Once again, we will create a custom function. The full code is available on the GitHub [repo](https://github.com/baggiponte/escooters-louisville-r).
 
-```{r}
+```{r, echo=FALSE}
 # base plot
 
 chord_plot <- function(my_data) {
@@ -252,16 +184,16 @@ chord_plot <- function(my_data) {
 
 ```
 
-## Plot the Chord Diagrams
+And finally we can plot the final results:
 
 ```{r}
+# with all neighbourhoods
 twoway_freq %>%
   prep_cord_data() %>%
   chord_plot()
 
+# only top neighbourhoods
 twoway %>%
   prep_cord_data() %>%
   chord_plot()
 ```
-
-

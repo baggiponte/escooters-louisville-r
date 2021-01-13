@@ -1,0 +1,111 @@
+---
+title: "Model 5: Ranfom Forest"
+author: "Luca Baggi"
+date: "13/01/2021"
+---
+
+# Load libraries
+
+```{r, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+
+# for downsampling
+library(themis)
+
+# for visualising importance of predictors
+library(vip)
+```
+
+# Load Data
+
+# Split in Train and Test Data
+
+Class imbalance needs to be addressed with stratified sampling, as we did in the earlier post:
+
+```{r}
+set.seed(42)
+
+trips_split <- initial_split(trips, strata = EndNH)
+
+trips_train <- training(trips_split)
+trips_test <- testing(trips_split)
+```
+
+# Define a recipe
+
+Let's define a recipe to address this problem. We shall `themis::step_downsample()` the data, which would achieve two goals:
+
+1. Address class imbalance.
+2. Reduce computational workload, given our limited computational resources.
+
+```{r}
+trips_recipe <- trips_train %>%
+  recipe(EndNH ~ .) %>%
+  # problem: step_date does not extract times!
+  step_mutate(HourNum = format(strptime(StartTime,'%Y-%m-%d %H:%M:%S'),'%H')) %>%
+  # turn it into a factor
+  step_string2factor(HourNum) %>%
+  # create factors out of StartTime
+  step_date(StartTime, features = c('dow', 'month', 'year')) %>%
+  # create holiday dummy:
+  step_holiday(StartTime, holidays = timeDate::listHolidays("US")) %>%
+  # remove StartTime col
+  step_rm(StartTime) %>%
+  # turn factor-features into binary dummies (i.e. one per column: 1-0):
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # remove predictors with zero variance:
+  step_zv(all_predictors()) %>%
+  # downsample the data: each class is as numerous as the least represented
+  themis::step_downsample(EndNH, under_ratio = 1)
+```
+
+# Define a model with parameters to tune
+
+```{r}
+tree_to_tune <- 
+  decision_tree(
+    cost_complexity = tune(),
+    tree_depth = tune()
+  ) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tree_to_tune
+```
+
+# Add a recipe and the model to a tuning workflow
+
+```{r}
+tree_tuning_workflow <-
+  workflow() %>%
+  add_model(tree_to_tune) %>%
+  add_recipe(trips_recipe)
+
+tree_tuning_workflow
+```
+
+
+# Define the tuning grid
+
+```{r}
+tree_tune_grid <- dials::grid_regular(cost_complexity(),
+                               tree_depth(),
+                               levels = 5)
+
+tree_tune_grid
+```
+
+# Create the `resamples` via `k-fold` cross validation
+
+Defaults are `v = 10` and `repeats = 1`: we will stick with these, because given the large number of observations our hardware can't deal with more than one repeat. Folds are stratified, to ensure equal representation.
+
+```{r}
+set.seed(42)
+
+tree_cv_folds <-
+  trips_train %>%
+  vfold_cv(strata = "StartNH")
+
+tree_cv_folds
+```

@@ -1,0 +1,208 @@
+---
+title: 'Extra: K-Means Clustering'
+author: Luca Baggi
+date: '2021-01-14'
+slug: []
+categories: []
+tags: []
+ShowToc: true
+---
+
+Finally, we want to see how many clusters of data can be found by analysing patterns: perhaps the model will catch flows between neighbourhoods or cluster data by date.
+
+# Load Packages
+
+```{r, message=FALSE}
+# for manipulating data
+library(tidyverse)
+
+# for plotting dendograms
+library(dendextend)
+
+# for kmeans
+library(factoextra)
+library(NbClust)
+```
+
+# Load Data
+
+Load the data for one last time:
+
+```{r}
+trips <-
+  read_csv(
+    'https://raw.githubusercontent.com/baggiponte/escooters-louisville-r/main/data/escooters_od_reduced.csv',
+    col_types = cols(
+      StartTime = col_datetime(format = '%Y-%m-%dT%H:%M:%SZ'),
+      Covid = col_factor(),
+      StartNH = col_factor(),
+      EndNH = col_factor()
+    )) %>%
+  slice_sample(prop = 0.1) %>%
+  as_tibble()
+```
+
+# Standardise the Data
+
+We need standardised data to have comparable variables, then compute the distances:
+
+```{r}
+distance <- trips %>%
+  mutate(across(where(is.factor), as.numeric)) %>%
+  mutate(StartTime = as.numeric(StartTime)) %>%
+  scale() %>%
+  dist(method = 'euclidean')
+```
+
+# Compare Different Hierarchical Clustering Distances
+
+## Complete Linkage
+
+Let's start with the `complete` linkage:
+
+```{r}
+set.seed(42)
+
+# compute the clusters
+hclust_complete <- hclust(distance, method = 'complete')
+
+# and plot them
+plot(hclust_complete, labels = F)
+
+# cut at the expected height of the number of our NH
+cut_complete <- hclust_complete %>%
+  cutree(6)
+```
+
+And we create a table with the combinations. Let's use a custom function:
+
+```{r}
+clust_table <- function(cut, col1) {
+  
+  tibble(cut = cut, col1 = trips[[col1]]) %>%
+  mutate(cut = as.factor(cut)) %>%
+  group_by(col1) %>%
+  count(cut) %>%
+  pivot_wider(names_from = col1, values_from = n)
+}
+```
+
+And then create the two tables:
+
+```{r}
+clust_table(cut_complete, 'StartNH')
+clust_table(cut_complete, 'EndNH')
+```
+
+## Single Linkage
+
+And let's compare it with the `single` distance:
+
+```{r}
+set.seed(42)
+# compute the clusters
+hclust_single <- hclust(distance, method = 'single')
+
+# and plot them
+plot(hclust_single, labels = F)
+
+# cut at the expected height of the number of our NH
+cut_single <- hclust_single %>%
+  cutree(6)
+```
+
+And see the correspondences:
+
+```{r}
+clust_table(cut_single, 'StartNH')
+clust_table(cut_single, 'EndNH')
+```
+
+It is no better! Clusters are assigned in the same way, except until `Southeast Core`.
+
+# Plot Prettier Dendograms
+
+```{r}
+as.dendrogram(hclust_complete) %>%
+  color_branches(h = 6) %>%
+  plot()
+
+as.dendrogram(hclust_single) %>%
+  color_branches(h = 6) %>%
+  plot()
+```
+
+This is the problem with single linkage! Clusters are too spread out and not close enough.
+
+# Mapping
+
+Finally, we can plot the points with `ggplot`:
+
+```{r}
+trips %>%
+  bind_cols(cut_complete) %>%
+  ggplot(aes(x = StartLongitude, y = StartLatitude, col = factor(cut_complete))) + 
+  geom_point() +
+  labs(x = 'Start Longitude',
+       y = 'Start Latitude',
+       col = 'Cluster',
+       title = 'Complete Linkage')
+
+trips %>%
+  bind_cols(cut_single) %>%
+  ggplot(aes(x = StartLongitude, y = StartLatitude, col = factor(cut_single))) + 
+  geom_point() +
+  labs(x = 'Start Longitude',
+       y = 'Start Latitude',
+       col = 'Cluster',
+       title = 'Single Linkage')
+```
+
+# K-Means Clustering
+
+```{r}
+set.seed(42)
+
+trips %>%
+  mutate(across(where(is.factor), as.numeric)) %>%
+  mutate(StartTime = as.numeric(StartTime)) %>%
+  scale() -> df
+
+df %>%
+  fviz_nbclust(
+    kmeans,
+    method = 'wss',
+    k.max = 20,
+    # number of MC resamples
+    nboot = 200
+  ) +
+  labs(subtitle = 'wss')
+```
+
+There are at least 6 clusters, which corresponds to the actual number of neighbourhoods! Another equivalent way of doing it is with `NbClust`:
+
+```{r}
+set.seed(42)
+
+nb_clusters_gap <- df %>%
+  NbClust(distance = 'euclidean',
+          min.nc = 2,
+          max.nc = 20,
+          method = 'kmeans',
+          index = 'gap')
+
+nb_clusters_gap$Best.nc
+
+
+nb_clusters_ch <- df %>%
+  NbClust(distance = 'euclidean',
+          min.nc = 2,
+          max.nc = 20,
+          method = 'kmeans',
+          # Calinski & Harabasz criterion
+          index = 'ch')
+
+nb_clusters_ch$Best.nc
+```
+
+However, different indexes give indications for different cluster numbers! `ch` maximises the ratio of the between cluster variation and within cluster variation. `gap` gives a measure of how much `wss` drops with each cluster.

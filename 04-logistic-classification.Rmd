@@ -142,6 +142,7 @@ tuning_folds <-
   trips_train %>%
   vfold_cv(v = 5, strata = 'EndNH')
 ```
+
 # Hyperparameters Tuning
 
 ## Cross Validation
@@ -249,6 +250,7 @@ Let's get the metrics:
 logistic_last_fit %>%
   collect_metrics()
 ```
+
 Which, unfortunately, has lower accuracy than our train model! The ideal situation would be to display a higher test accuracy, compared to the training. Also, the missing `auc_roc` seems a bad sign. However, since we are doing multinomial classification, it is to be expected! The most we might get is a ROC measure for each class against the other, after grouping them.
 
 Let's see the contribution of each variable:
@@ -259,6 +261,7 @@ logistic_last_fit %>%
   pull_workflow_fit() %>%
   vip()
 ```
+
 # Model Evaluation
 
 The program can't tell us the predictions associated with each class, but we are interested in `.pred_class`:
@@ -278,6 +281,6 @@ logistic_last_fit %>%
   autoplot(type = 'heatmap')
 ```
 
-# Final Considerations:
+# Final Considerations
 
 Some mismatches may be due to proximity of the destinations, which we do not account for here.
